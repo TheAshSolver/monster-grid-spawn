@@ -170,9 +170,8 @@ struct ThreadPool {
 
     struct BarrierPhaseCompletion {
         void operator()() noexcept {
-        
             std::swap(src, dst);
-            dst->clear(); 
+            // Each thread clears its own band of the new dst in parallel.
         }
     };
 
@@ -184,9 +183,6 @@ struct ThreadPool {
 static void step_thread(int y_start, ThreadPool &pool) noexcept;
 
 void initialize_threads(ThreadPool &pool) {
-    // Clear the destination grid before generation 0 begins
-    dst->clear();
-
     const int N               = src->size;
     const int rows_per_thread = N / NUM_THREADS;
     
@@ -500,18 +496,25 @@ static void step_thread(int y_start, ThreadPool &pool) noexcept
     const int y_end           = y_start + rows_per_thread;
 
     for (int i = 0; i < GENERATIONS; i++) {
-        // Read the global pointers locally so they are stable for this generation
         BitGrid& current_src = *src;
         BitGrid& current_dst = *dst;
+
+        // Clear this thread's band of dst in parallel with the other threads.
+        const size_t band_offset = static_cast<size_t>(y_start) * wpr;
+        const size_t band_words  = static_cast<size_t>(rows_per_thread) * wpr;
+        std::fill(current_dst.egg.data()   + band_offset,
+                  current_dst.egg.data()   + band_offset + band_words, uint64_t{0});
+        std::fill(current_dst.juv.data()   + band_offset,
+                  current_dst.juv.data()   + band_offset + band_words, uint64_t{0});
+        std::fill(current_dst.adult.data() + band_offset,
+                  current_dst.adult.data() + band_offset + band_words, uint64_t{0});
 
         for (int y = y_start; y < y_end; ++y) {
             for (int w = 0; w < wpr; ++w) {
                 step_word(current_src, current_dst, w, y);
             }
         }
-        
-        // Wait for all threads. The last thread to arrive will automatically
-        // run BarrierPhaseCompletion, swapping src/dst and clearing the new dst.
+
         pool.b.arrive_and_wait();
     }
 }
