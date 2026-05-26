@@ -1,5 +1,6 @@
-# Compiled binary
+# Compiled binaries
 spawn_sim
+spawn_sim_*
 
 # Claude Code memory
 .claude/
