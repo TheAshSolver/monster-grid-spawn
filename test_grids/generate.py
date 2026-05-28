@@ -9,13 +9,13 @@ Usage:
     python3 test_grids/generate.py
 
     # Also generate expected outputs for small sizes (seconds to minutes):
-    python3 test_grids/generate.py --generate-expected --sizes 512,2048
+    python3 test_grids/generate.py  --sizes 512,2048
 
     # Expected outputs for medium sizes (run in screen, ~minutes each):
     python3 test_grids/generate.py --generate-expected --sizes 8192
 
     # Expected outputs for large sizes (run in screen, ~25h each):
-    python3 test_grids/generate.py --generate-expected --sizes 32768
+    python3 test_grids/generate.py  --sizes 32768
 
     # --sizes applies to both input and expected output generation.
     # Already-existing .expected.bin files are skipped unless --force is passed.

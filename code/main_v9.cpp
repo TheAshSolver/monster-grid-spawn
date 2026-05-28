@@ -63,6 +63,8 @@
 
 static constexpr int NEIGHBOUR_RANGE = 2;   // range-2 Moore neighbourhood
 static constexpr int NUM_THREADS     = 8;   // one per physical core on c8g.2xlarge
+static constexpr int TILE_ROWS       = 8;   // cache-tiling: rows per tile
+static constexpr int PREFETCH_DIST   = 4;   // adult rows to prefetch ahead
 
 // ─────────────────────────────────────────────────────────────────────────────
 // BitGrid
@@ -115,17 +117,19 @@ struct BitGrid {
     void pack_row(int y, const uint8_t* row_bytes) noexcept
     {
         const size_t base = static_cast<size_t>(y) * words_per_row;
+        const uint8x8_t scales = {1, 2, 4, 8, 16, 32, 64, 128};
         for (int w = 0; w < words_per_row; ++w) {
-            uint64_t e = 0, j = 0, a = 0;
             const uint8_t* src = row_bytes + w * 64;
-            for (int b = 0; b < 64; ++b) {
-                const uint64_t mask = uint64_t{1} << b;
-                switch (src[b]) {
-                    case 1: e |= mask; break;
-                    case 2: j |= mask; break;
-                    case 3: a |= mask; break;
-                    default: break;   // 0 = EMPTY, already zero
-                }
+            uint64_t e = 0, j = 0, a = 0;
+            for (int c = 0; c < 8; ++c) {
+                const uint8x8_t v = vld1_u8(src + c * 8);
+                const uint64_t lo = vget_lane_u64(vpaddl_u32(vpaddl_u16(vpaddl_u8(
+                    vmul_u8(vand_u8(v, vdup_n_u8(1)), scales)))), 0) << (c * 8);
+                const uint64_t hi = vget_lane_u64(vpaddl_u32(vpaddl_u16(vpaddl_u8(
+                    vmul_u8(vand_u8(vshr_n_u8(v, 1), vdup_n_u8(1)), scales)))), 0) << (c * 8);
+                e |= lo & ~hi;
+                j |= hi & ~lo;
+                a |= lo &  hi;
             }
             egg  [base + w] = e;
             juv  [base + w] = j;
@@ -137,17 +141,19 @@ struct BitGrid {
     void unpack_row(int y, uint8_t* row_bytes) const noexcept
     {
         const size_t base = static_cast<size_t>(y) * words_per_row;
+        const int8x8_t neg_shifts = {0, -1, -2, -3, -4, -5, -6, -7};
         for (int w = 0; w < words_per_row; ++w) {
             const uint64_t e = egg  [base + w];
             const uint64_t j = juv  [base + w];
             const uint64_t a = adult[base + w];
             uint8_t* dst = row_bytes + w * 64;
-            for (int b = 0; b < 64; ++b) {
-                const uint64_t mask = uint64_t{1} << b;
-                if      (e & mask) dst[b] = 1;
-                else if (j & mask) dst[b] = 2;
-                else if (a & mask) dst[b] = 3;
-                else               dst[b] = 0;
+            for (int c = 0; c < 8; ++c) {
+                const uint8x8_t e_bits = vand_u8(vshl_u8(vdup_n_u8((e >> (c*8)) & 0xFF), neg_shifts), vdup_n_u8(1));
+                const uint8x8_t j_bits = vand_u8(vshl_u8(vdup_n_u8((j >> (c*8)) & 0xFF), neg_shifts), vdup_n_u8(1));
+                const uint8x8_t a_bits = vand_u8(vshl_u8(vdup_n_u8((a >> (c*8)) & 0xFF), neg_shifts), vdup_n_u8(1));
+                vst1_u8(dst + c * 8, vorr_u8(
+                    vorr_u8(e_bits, vshl_n_u8(j_bits, 1)),
+                    vadd_u8(a_bits, vshl_n_u8(a_bits, 1))));
             }
         }
     }
@@ -495,46 +501,50 @@ static BitGrid* run_simulation(BitGrid& grid_a, BitGrid& grid_b, int generations
     auto worker = [&](int y_start) noexcept {
         const int y_end = y_start + rows_per_thread;
 
-        // Per-thread sliding window: 5 rows of horizontal sums, stored SoA in
-        // three bit-planes.  The horizontal sum for logical row r lives in ring
-        // slot (r mod 5).  Allocated once, reused across generations.
-        std::vector<uint64_t> ringbuf(static_cast<size_t>(3) * 5 * wpr);
-        uint64_t* hb[3][5];
+        // Per-thread hrow buffer: (TILE_ROWS + 4) slots × wpr words × 3 planes (SoA).
+        // For each tile we precompute all needed row hsums up front, then emit.
+        // This lets prefetch run PREFETCH_DIST rows ahead of the hsum loads,
+        // and keeps the whole hrow window hot in L1 during the emit sweep.
+        static constexpr int N_HSLOTS = TILE_ROWS + 2 * NEIGHBOUR_RANGE;
+        std::vector<uint64_t> hrowbuf(static_cast<size_t>(3) * N_HSLOTS * wpr);
+        uint64_t* hb[3];
         for (int p = 0; p < 3; ++p)
-            for (int k = 0; k < 5; ++k)
-                hb[p][k] = ringbuf.data() + (static_cast<size_t>(p) * 5 + k) * wpr;
-        auto slot = [](int r) noexcept { return ((r % 5) + 5) % 5; };
-
-        auto do_hrow = [&](const uint64_t* A, int r) noexcept {
-            const int ar = (r + N) & (N - 1);
-            const int k  = slot(r);
-            compute_hrow(A + static_cast<size_t>(ar) * wpr, wpr, hb[0][k], hb[1][k], hb[2][k]);
-        };
+            hb[p] = hrowbuf.data() + static_cast<size_t>(p) * N_HSLOTS * wpr;
 
         for (int gen = 0; gen < generations; ++gen) {
             const BitGrid& s = *cur;
             BitGrid&       d = *nxt;
             const uint64_t* A = s.adult.data();
 
-            // Prime the window with horizontal sums for rows y_start-2 … y_start+1.
-            for (int r = y_start - 2; r <= y_start + 1; ++r)
-                do_hrow(A, r);
+            for (int y_tile = y_start; y_tile < y_end; y_tile += TILE_ROWS) {
+                const int tile_end = std::min(y_tile + TILE_ROWS, y_end);
+                const int n_hrows  = (tile_end - y_tile) + 2 * NEIGHBOUR_RANGE;
 
-            for (int y = y_start; y < y_end; ++y) {
-                do_hrow(A, y + 2);   // new bottom row entering the window
+                // Precompute hrow for every row the tile needs (y_tile-2 … tile_end+1).
+                // Prefetch PREFETCH_DIST adult rows ahead to hide DRAM latency.
+                for (int r = 0; r < n_hrows; ++r) {
+                    const int ry  = (y_tile - NEIGHBOUR_RANGE + r + N) & (N - 1);
+                    const int pry = (ry + PREFETCH_DIST + N) & (N - 1);
+                    __builtin_prefetch(A + static_cast<size_t>(pry) * wpr, 0, 1);
+                    compute_hrow(A + static_cast<size_t>(ry) * wpr, wpr,
+                                 hb[0] + static_cast<size_t>(r) * wpr,
+                                 hb[1] + static_cast<size_t>(r) * wpr,
+                                 hb[2] + static_cast<size_t>(r) * wpr);
+                }
 
-                const int k0 = slot(y - 2), k1 = slot(y - 1), k2 = slot(y),
-                          k3 = slot(y + 1), k4 = slot(y + 2);
-
-                const size_t   base = static_cast<size_t>(y) * wpr;
-                emit_row(wpr,
-                    hb[0][k0], hb[1][k0], hb[2][k0],
-                    hb[0][k1], hb[1][k1], hb[2][k1],
-                    hb[0][k2], hb[1][k2], hb[2][k2],
-                    hb[0][k3], hb[1][k3], hb[2][k3],
-                    hb[0][k4], hb[1][k4], hb[2][k4],
-                    s.egg.data() + base, s.juv.data() + base, s.adult.data() + base,
-                    d.egg.data() + base, d.juv.data() + base, d.adult.data() + base);
+                // Emit all output rows in this tile using the hot hrow buffer.
+                for (int y = y_tile; y < tile_end; ++y) {
+                    const int    b    = y - y_tile;
+                    const size_t base = static_cast<size_t>(y) * wpr;
+                    emit_row(wpr,
+                        hb[0]+(b+0)*wpr, hb[1]+(b+0)*wpr, hb[2]+(b+0)*wpr,
+                        hb[0]+(b+1)*wpr, hb[1]+(b+1)*wpr, hb[2]+(b+1)*wpr,
+                        hb[0]+(b+2)*wpr, hb[1]+(b+2)*wpr, hb[2]+(b+2)*wpr,
+                        hb[0]+(b+3)*wpr, hb[1]+(b+3)*wpr, hb[2]+(b+3)*wpr,
+                        hb[0]+(b+4)*wpr, hb[1]+(b+4)*wpr, hb[2]+(b+4)*wpr,
+                        s.egg.data()+base, s.juv.data()+base, s.adult.data()+base,
+                        d.egg.data()+base, d.juv.data()+base, d.adult.data()+base);
+                }
             }
             sync.arrive_and_wait();   // completion swaps cur/nxt
         }

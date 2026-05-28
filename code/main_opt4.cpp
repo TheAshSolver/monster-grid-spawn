@@ -60,13 +60,16 @@ struct Grid {
     void pack_row(int y, const uint8_t* row_bytes) noexcept {
         uint64_t* b0 = b0_row(y);
         uint64_t* b1 = b1_row(y);
+        const uint8x8_t scales = {1, 2, 4, 8, 16, 32, 64, 128};
         for (int w = 0; w < wpr; ++w) {
-            uint64_t lo = 0, hi = 0;
             const uint8_t* src = row_bytes + w * 64;
-            for (int b = 0; b < 64; ++b) {
-                const uint64_t m = uint64_t{1} << b;
-                if (src[b] & 1) lo |= m;
-                if (src[b] & 2) hi |= m;
+            uint64_t lo = 0, hi = 0;
+            for (int c = 0; c < 8; ++c) {
+                const uint8x8_t v = vld1_u8(src + c * 8);
+                lo |= vget_lane_u64(vpaddl_u32(vpaddl_u16(vpaddl_u8(
+                    vmul_u8(vand_u8(v, vdup_n_u8(1)), scales)))), 0) << (c * 8);
+                hi |= vget_lane_u64(vpaddl_u32(vpaddl_u16(vpaddl_u8(
+                    vmul_u8(vand_u8(vshr_n_u8(v, 1), vdup_n_u8(1)), scales)))), 0) << (c * 8);
             }
             b0[w] = lo; b1[w] = hi;
         }
@@ -74,11 +77,19 @@ struct Grid {
     void unpack_row(int y, uint8_t* row_bytes) const noexcept {
         const uint64_t* b0 = b0_row(y);
         const uint64_t* b1 = b1_row(y);
+        const int8x8_t neg_shifts = {0, -1, -2, -3, -4, -5, -6, -7};
         for (int w = 0; w < wpr; ++w) {
             const uint64_t lo = b0[w], hi = b1[w];
             uint8_t* dst = row_bytes + w * 64;
-            for (int b = 0; b < 64; ++b)
-                dst[b] = static_cast<uint8_t>(((lo >> b) & 1) | (((hi >> b) & 1) << 1));
+            for (int c = 0; c < 8; ++c) {
+                const uint8x8_t lo_bits = vand_u8(
+                    vshl_u8(vdup_n_u8((lo >> (c * 8)) & 0xFF), neg_shifts),
+                    vdup_n_u8(1));
+                const uint8x8_t hi_bits = vand_u8(
+                    vshl_u8(vdup_n_u8((hi >> (c * 8)) & 0xFF), neg_shifts),
+                    vdup_n_u8(1));
+                vst1_u8(dst + c * 8, vorr_u8(lo_bits, vshl_n_u8(hi_bits, 1)));
+            }
         }
     }
 };
