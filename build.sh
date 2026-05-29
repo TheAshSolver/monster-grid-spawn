@@ -13,11 +13,8 @@ CXXFLAGS="-std=c++23 -O3 -mcpu=neoverse-v2 -Wall -Wextra"
 OUTPUT="${OUTPUT:-spawn_sim}"
 # Default: code/main.cpp.  Set TARGET=opt for code/main_opt.cpp.
 case "${TARGET:-}" in
-    opt)  SOURCE="code/main_opt.cpp" ;;
-    opt2) SOURCE="code/main_opt2.cpp" ;;
-    opt3) SOURCE="code/main_opt3.cpp" ;;
-    opt4) SOURCE="code/main_opt4.cpp" ;;
-    *)    SOURCE="code/main.cpp" ;;
+    opt)  SOURCE="code/main.cpp" ;;
+    *)    SOURCE="code/main_v11.cpp" ;;
 esac
 
 echo "Building $SOURCE with $CXX ..."
