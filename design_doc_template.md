@@ -1,11 +1,3 @@
-# Design Document — Monster Spawning Grid
-**Name:** ___________________  
-**Date:** ___________________  
-**Final median time (10 runs, public_1):** ___________________ ms  
-**Reference median time (10 runs, public_1):** ___________________ ms  
-**Speedup:** ___________________×
-
----
 
 ## 1. Cell Representation
 
